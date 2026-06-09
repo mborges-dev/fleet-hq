@@ -1,7 +1,6 @@
 # Fleet HQ
 
 [![CI](https://github.com/mborges-dev/fleet-hq/actions/workflows/ci.yml/badge.svg)](https://github.com/mborges-dev/fleet-hq/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-black.svg)](#)
 [![Status: v0.1 alpha](https://img.shields.io/badge/status-v0.1%20alpha-orange.svg)](CHANGELOG.md)
 
@@ -191,6 +190,12 @@ This consolidates two earlier projects:
 - **fleet** — the generic multi-agent CLI extracted from mini-miguel
 
 Both are archived in favor of this repo. The avatar pattern, the personality layer, and the file-based agent contract all live here now.
+
+---
+
+## Notice
+
+This repository is published as a **portfolio showcase** of my work. The code is **not licensed for reuse, redistribution, or modification.** You're welcome to read it, but it is not open source. If you'd like to discuss similar work, [get in touch](mailto:hello@miguelborges.dev).
 
 ---
 
