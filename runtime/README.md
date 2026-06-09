@@ -21,9 +21,16 @@ Fleet's runtime state lives in `$HOME/.fleet` (override with `FLEET_HOME`). This
 │   ├── events.log          ← audit log
 │   └── watcher.log         ← watcher daemon log
 │
+├── memory/                 ← long-term shared + per-agent memory
+│   ├── index.db            ← SQLite FTS5 (auto-built, derived)
+│   ├── shared/             ← voice, brand, pricing, customer, …
+│   └── agents/<name>/      ← per-agent episodic, decisions, lessons
+│
 ├── secrets/                ← per-agent credentials, gitignored
 └── triggers/               ← drop-file trigger queue
 ```
+
+See [memory/README.md](memory/README.md) for how the memory system works (it's its own thing — markdown files + SQLite FTS index).
 
 ## Bootstrap
 
