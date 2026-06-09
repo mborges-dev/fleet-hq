@@ -67,6 +67,24 @@ Agents never call other agents directly. Four patterns:
 
 It's optional. Fleet works without it — the watcher exists to replace fixed cron schedules with event-driven activation.
 
+## The memory layer
+
+Two things sit on top of plain `~/.fleet/data/`:
+
+**`personality.md` per agent** (committed alongside `CLAUDE.md`) overlays the operator's baseline voice. Same role + different personality file = noticeably different tone and decision profile. The personality inherits from `~/.fleet/memory/shared/voice.md` — the operator's identity is defined once and applied everywhere.
+
+**`~/.fleet/memory/`** is a shared long-term store with two scopes — `shared/` (read by every agent: voice, brand, pricing, playbook, failures, etc.) and `agents/<name>/` (episodic, decisions, lessons per agent). Files are plain markdown; a SQLite FTS5 index sits on top for fast search and recall:
+
+```bash
+fleet memory search "cold DM cadence"
+fleet memory recall ceo                       # most-relevant blocks for the CEO
+fleet memory write shared/failures.md --from coo "Discord SDR cadence too aggressive — account flagged."
+```
+
+The DB is a derived artifact. Edit the markdown directly, then `fleet memory reindex`.
+
+This layer is **read-mostly during work**, **append-mostly between cycles** — a useful split because it lets agents read shared context cheaply (memory is small and cached) while keeping write-back explicit so the operator can see what each agent learned.
+
 ## Why CLAUDE.md per agent
 
 Each agent's mission lives in `agents/<name>/CLAUDE.md`. Claude Code reads it automatically as project context when `claude` starts. This means:

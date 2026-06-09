@@ -4,12 +4,22 @@ All notable changes to Fleet HQ will be documented here. Format follows [Keep a 
 
 ## [Unreleased]
 
+### Added (post-v0.1)
+
+- **`personality.md` per agent** — `agents/<name>/personality.md` overlays the operator's baseline voice with the agent's specific risk / time / ethics / communication profile. Every existing agent (30) plus 5 new ones (`gig-builder`, `gig-responder`, `intel-synth`, `lead-scout`, `listing-bot`) now ship with personality files.
+- **Memory store** under `~/.fleet/memory/` — plain markdown files (`shared/voice.md`, `shared/pricing.md`, `agents/<name>/episodic.md`, …) with a SQLite FTS5 index on top.
+- **`fleet memory` command** with verbs `write` · `read` · `list` · `search` · `recall` · `reindex` · `stats`.
+- **`scripts/memory.sh` + `scripts/memory-init.sh`** — idempotent runtime memory backend.
+- **`runtime/memory/`** — example layout including `shared/voice.example.md` template.
+
 ### Planned for v0.2
+
 - Linux support (the bash is portable, the path detection needs work)
 - `npx fleet` and `brew install` distribution
 - Per-agent token bars in the dashboard
 - Smarter inbox routing — per-agent thresholds for "interrupt now" vs "queue"
 - Public agent template gallery
+- Dashboard surface for memory search (currently CLI-only)
 
 ## [0.1.0] — 2026-06-09
 

@@ -133,6 +133,35 @@ Full command reference: `fleet help`.
 
 ---
 
+## Memory and personality
+
+Each agent ships with two files instead of one:
+
+```
+agents/<name>/
+├── CLAUDE.md        ← mission · procedure · output · KPIs
+└── personality.md   ← vibe · role overlay · how it modulates the baseline
+```
+
+The mission tells the agent *what* to do; the personality tells it *how* to do it — risk posture, ethics bright lines, communication style, escalation thresholds.
+
+Every personality inherits from a **single baseline voice** at `~/.fleet/memory/shared/voice.md` — the operator's own tone, risk profile and ethics. Each agent's `personality.md` only documents how *that role* overlays the baseline (CFO is more conservative than CEO, the COO is terser than the brand-editor, etc.).
+
+Around that, Fleet exposes a small **memory store**: plain markdown files under `~/.fleet/memory/` with a SQLite FTS5 index on top for fast search and recall:
+
+```bash
+fleet memory write shared/playbook.md --from coo "Cold-DM cadence: 1, 4, 11 days. Tested in May, ~9% reply rate."
+fleet memory search "cold DM cadence"
+fleet memory recall ceo                       # most-relevant blocks for the CEO agent
+fleet memory reindex                          # rebuild FTS from disk
+```
+
+`shared/` is read by every agent (voice, brand, pricing, customer, competitive, playbook, failures, glossary, goals). `agents/<name>/` is per-agent episodic memory — what it did, what it decided, what it learned. Everything stays as readable markdown; the index is just a derived artifact.
+
+See [runtime/memory/README.md](runtime/memory/README.md) for the full layout and [docs/writing-an-agent.md](docs/writing-an-agent.md) for how personality.md composes with CLAUDE.md.
+
+---
+
 ## Why this exists
 
 I tried LangGraph. I tried CrewAI. I tried AutoGen. They all demanded I express my work as graphs, YAML, role schemas, or pip-installable orchestration runtimes. By the time I'd modeled the problem in the framework's vocabulary, I'd lost the thread of the work itself.

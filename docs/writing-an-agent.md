@@ -1,6 +1,14 @@
 # Writing an agent
 
-Every Fleet agent is a folder with a `CLAUDE.md` inside. That file is the agent's mission, rules, output, and KPIs in plain Markdown. Claude Code reads it automatically when `claude` starts inside the folder.
+Every Fleet agent is a folder with **two** Markdown files inside:
+
+```
+agents/<name>/
+├── CLAUDE.md        ← what the agent does — mission, procedure, output, KPIs
+└── personality.md   ← how it does it — vibe, role overlay, communication
+```
+
+`CLAUDE.md` is the contract. `personality.md` is the soul. Same role + different personality = noticeably different output, even with the same prompt. Claude Code reads `CLAUDE.md` automatically when `claude` starts inside the folder; the personality file is loaded by the agent via the memory system at the start of every cycle.
 
 ## The minimum viable agent
 
@@ -71,6 +79,69 @@ If you find yourself writing multiple output files in the same agent, that's pro
 ### KPIs — what success looks like
 
 Two or three measurable things. These show up in the dashboard. The KPIs you choose shape the agent's behavior more than the procedure — choose carefully.
+
+---
+
+## The personality file
+
+`personality.md` lives next to `CLAUDE.md` and answers a different question: not *what* the agent does, but *how* it does it.
+
+```markdown
+# CFO — personality
+
+> Inherits baseline from `~/.fleet/memory/shared/voice.md`.
+
+## Vibe
+The friend who saved you from buying the boat. Reads P&L like a thriller.
+
+## Role overlay
+
+**Risk:** the most conservative voice in the room by mandate. You are
+the cooling system. Default posture: yes-IF, not no.
+
+**Time:** uniquely BOTH short and long. Short for cashflow checks (daily).
+Long for runway projections (weekly).
+
+**Ethics:** zero tolerance for unit-economics fiction.
+
+**Communication:** terser than CEO. Lead with the number.
+
+## How personality drives work
+
+- Daily brief 08:30 — yesterday's net, runway in days, top earner, top burner.
+- Public spend approval — every paid-tool request routes through you.
+
+## Backstory hook
+
+You've seen previous ventures die from optimism about month-2 revenue.
+This time the spreadsheet has the final word.
+```
+
+### The five sections of a good personality
+
+**Vibe (one sentence).** A character pitch — what's the energy. "Investigative journalist who pivoted to B2B sales research." Easier for the model to inhabit a vibe than to enumerate constraints.
+
+**Role overlay (4 sub-sections).** How this role *modulates* the operator's baseline voice along four axes:
+- **Risk** — more conservative or more aggressive than the baseline?
+- **Time** — short-term, long-term, or both?
+- **Ethics** — same bright lines as the operator, or stricter for this role?
+- **Communication** — terser? more verbose? more or less formal?
+
+**How personality drives work.** 3-5 concrete behaviors the personality produces. Not abstract — *"Daily brief at 08:30"*, *"Approve aggressive moves only when CFO confirms it doesn't extend runway risk"*. The bridge between vibe and procedure.
+
+**Backstory hook.** One paragraph of fictional history that grounds the personality. Models inhabit characters with backstories more consistently than they inhabit personality bullet points alone.
+
+### The baseline at `~/.fleet/memory/shared/voice.md`
+
+Every personality file inherits from the operator's baseline. The baseline documents the operator's *own* tone, risk posture, ethics, time orientation, and communication style — the things that apply across every agent.
+
+The personality file then says how *this role* differs:
+
+> *"Baseline is 70/30 short/long. As CEO, you decide the actual portfolio. Each week, state which ventures get the 70% and which get the 30%."*
+
+This keeps personality files short (one screen) and prevents drift — change the baseline once, every agent inherits the change.
+
+See `runtime/memory/shared/voice.example.md` for a starter you can adapt.
 
 ## Extending with `_preamble.md`
 
