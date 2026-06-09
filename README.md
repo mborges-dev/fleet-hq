@@ -1,5 +1,10 @@
 # Fleet HQ
 
+[![CI](https://github.com/mborges-dev/fleet-hq/actions/workflows/ci.yml/badge.svg)](https://github.com/mborges-dev/fleet-hq/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platform: macOS](https://img.shields.io/badge/platform-macOS-black.svg)](#)
+[![Status: v0.1 alpha](https://img.shields.io/badge/status-v0.1%20alpha-orange.svg)](CHANGELOG.md)
+
 **A single-operator command center for running teams of Claude agents — CLI + live 3D dashboard + opinionated runtime.**
 
 Fleet HQ is the operating system for working alongside dozens of autonomous AI agents from one keyboard. You define each agent's mission in a Markdown file. Fleet launches them in parallel tmux sessions. The dashboard renders the whole fleet as a cyberpunk command bridge — agents move around 3D worlds, ask you questions, log earnings, propose decisions.
