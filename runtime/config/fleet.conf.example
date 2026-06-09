@@ -1,0 +1,14 @@
+# Fleet global configuration
+# Copy to ~/.fleet/config/fleet.conf and edit
+
+# Your name — used in agent context
+OWNER_NAME="Your Name"
+
+# Default language for agent responses
+AGENT_LANGUAGE="en"
+
+# DND window (leave empty for always-on)
+# DND_WINDOW="22:00-09:00"
+
+# Notification sound (macOS only, leave empty to disable)
+# NOTIFY_SOUND="Glass"

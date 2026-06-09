@@ -1,0 +1,53 @@
+# ── Runtime state (must NEVER be committed) ─────────────────────────
+.fleet/
+.fleet.local/
+
+# Local versions of the example runtime configs (after dropping .example.)
+runtime/config/fleet.conf
+runtime/config/goal.tsv
+runtime/config/mode.tsv
+runtime/config/worlds.tsv
+runtime/config/*.key
+runtime/data/*.tsv
+runtime/data/*.log
+runtime/data/agent-plan.md
+runtime/data/watcher-state/
+
+# ── Per-agent local state ───────────────────────────────────────────
+# Agents create output files inside their own folder (e.g. report.md, draft.md).
+# Convention: only CLAUDE.md is meant to be tracked per agent.
+# Subfolders agents create at runtime are gitignored below.
+agents/*/for-review/
+agents/*/output/
+agents/*/inbox/
+agents/*/drafts/
+agents/*/state/
+
+# ── Dashboard 3D model assets (licensing-uncertain GLBs) ────────────
+dashboard/assets/*.glb
+dashboard/assets/*.glb.t2m
+dashboard/assets/*.jpg
+dashboard/assets/*.webp
+dashboard/assets/raw/
+
+# ── Node ────────────────────────────────────────────────────────────
+node_modules/
+dashboard/node_modules/
+*.log
+npm-debug.log*
+
+# ── Secrets ─────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.key
+!runtime/config/*.key.example
+secrets/
+
+# ── Editor / OS / Claude tooling ────────────────────────────────────
+.DS_Store
+.vscode/
+.idea/
+.claude/
+.agents/
+skills-lock.json

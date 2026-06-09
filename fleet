@@ -1,0 +1,1143 @@
+#!/bin/bash
+# fleet — CLI for running teams of Claude agents organised into "worlds".
+#
+# Each agent is a Claude Code session in tmux, defined by a CLAUDE.md file
+# and assigned to a world (department or project). fleet launches, briefs,
+# monitors, and terminates agents without requiring you to attach to any
+# terminal. Agents can run continuously via the scheduler, talk to each
+# other in per-world chat, and surface activity live in the dashboard.
+#
+# Usage: fleet <command> [args]    ·    fleet help
+set -euo pipefail
+
+FLEET_HOME="${FLEET_HOME:-$HOME/.fleet}"
+SCRIPTS="$(cd "$(dirname "$0")/scripts" && pwd)"
+CONFIG="$FLEET_HOME/config"
+DATA="$FLEET_HOME/data"
+DASHBOARD_DIR="$(cd "$(dirname "$0")/dashboard" && pwd)"
+CHAT_LOG="$DATA/chat.log"
+EVENTS_LOG="$DATA/events.log"
+REVENUE_FILE="$DATA/revenue.tsv"
+ASKS_FILE="$DATA/asks.tsv"
+PROPOSALS_FILE="$DATA/proposals.tsv"
+VENTURES_FILE="$DATA/ventures.tsv"
+GOAL_FILE="$CONFIG/goal.tsv"
+SCHEDULES_FILE="$DATA/schedules.tsv"
+TEMPLATES_DIR="$(cd "$(dirname "$0")/agents/templates" 2>/dev/null && pwd || echo "$(cd "$(dirname "$0")" && pwd)/agents/templates")"
+WORLDS_FILE="$CONFIG/worlds.tsv"
+AGENT_WORLDS_FILE="$DATA/agent-worlds.tsv"
+SCHED_SESSION="fleet-scheduler"
+
+# Fleet agents are pinned to Sonnet 4.6. Override with FLEET_MODEL=<id> if needed.
+FLEET_MODEL="${FLEET_MODEL:-claude-sonnet-4-6}"
+
+TMUX_BIN=$(command -v tmux 2>/dev/null \
+  || ls /opt/homebrew/bin/tmux /usr/local/bin/tmux /usr/bin/tmux 2>/dev/null | head -1 \
+  || echo "tmux")
+
+# ── Colours (terminal only) ──────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+  GREEN=$'\033[32m'; YELLOW=$'\033[33m'; CYAN=$'\033[36m'; RED=$'\033[31m'
+  MAGENTA=$'\033[35m'
+else
+  BOLD=""; DIM=""; RESET=""; GREEN=""; YELLOW=""; CYAN=""; RED=""; MAGENTA=""
+fi
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+ensure_dirs() { mkdir -p "$DATA" "$CONFIG"; }
+
+seed_worlds() {
+  # 8 default worlds. Column 3 is an icon key (rendered as inline SVG by the UI).
+  # This is idempotent: missing default worlds are appended; user-customized
+  # worlds (with their own colors/descriptions) are preserved as-is.
+  ensure_dirs
+  [[ -f "$WORLDS_FILE" ]] || : > "$WORLDS_FILE"
+  # Columns: id  name  icon  color  theme  kind  description
+  #   kind ∈ { command, support, revenue }
+  #   support worlds (research, intelligence) feed revenue worlds with findings,
+  #   ideas, briefs. Revenue worlds use those outputs to actually make money.
+  local defaults
+  defaults=$(cat <<'TSV'
+hq	HQ	radar	#84C7AE	grid	command	Command center — global view across every world
+research	Research	magnifier	#7BC4D6	radar	support	Lead gen, niches, market intel — feeds all revenue worlds
+intelligence	Intelligence	brain	#C895D6	hex	support	Synthesis, strategy, decision briefs — feeds all revenue worlds
+etsy	Etsy Stores	store	#D6986C	grid	revenue	Etsy storefronts — listings, niches, sales
+youtube	YouTube	play	#E16060	hex	revenue	YouTube channels — content, growth, monetization
+fiverr	Fiverr	briefcase	#3BD66D	dots	revenue	Fiverr AI services — gigs, orders, delivery
+ai-dropship	AI Dropshipping	cart	#D69D7B	dots	revenue	Dropshipping automation pipeline
+examplebrand	ExampleBrand	vault	#A9D67B	vault	revenue	Example consumer brand — replace with your own vertical
+TSV
+)
+  local id
+  while IFS=$'\t' read -r id _; do
+    [[ -z "$id" ]] && continue
+    if ! grep -q "^${id}	" "$WORLDS_FILE" 2>/dev/null; then
+      grep "^${id}	" <(printf '%s\n' "$defaults") >> "$WORLDS_FILE"
+    fi
+  done < <(printf '%s\n' "$defaults")
+}
+
+dnd_rule() {
+  local conf="$CONFIG/dnd.conf" line trimmed
+  [[ -f "$conf" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$trimmed" || "$trimmed" == \#* ]] && continue
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    printf '%s' "$trimmed"; return 0
+  done < "$conf"
+}
+
+dnd_active() {
+  local rule="$1" start end sh sm eh em now s_min e_min
+  case "$rule" in
+    "")       return 1 ;;
+    OFF|off)  return 0 ;;
+    *-*)
+      start="${rule%-*}"; end="${rule#*-}"
+      sh="${start%:*}"; sm="${start#*:}"; eh="${end%:*}"; em="${end#*:}"
+      now=$(( 10#$(date +%H)*60 + 10#$(date +%M) ))
+      s_min=$(( 10#$sh*60 + 10#$sm )); e_min=$(( 10#$eh*60 + 10#$em ))
+      if (( s_min <= e_min )); then (( now >= s_min && now < e_min )) && return 0 || return 1
+      else (( now >= s_min || now < e_min )) && return 0 || return 1; fi ;;
+    *) return 1 ;;
+  esac
+}
+
+human_since() {
+  local created="$1" now diff h m
+  now=$(date +%s); diff=$(( now - created ))
+  (( diff < 0 )) && diff=0
+  h=$(( diff/3600 )); m=$(( (diff%3600)/60 ))
+  printf '%dh %dm' "$h" "$m"
+}
+
+require_tmux() {
+  if ! command -v tmux >/dev/null 2>&1 && [[ ! -x "$TMUX_BIN" ]]; then
+    echo "Error: tmux not found. Install with: brew install tmux" >&2; exit 1
+  fi
+}
+
+require_session() {
+  local s="$1" usage="$2"
+  [[ -z "$s" ]] && { echo "Error: session name required. Usage: $usage" >&2; exit 1; }
+  require_tmux
+  $TMUX_BIN has-session -t "$s" 2>/dev/null || {
+    echo "Error: no session '$s'." >&2
+    $TMUX_BIN ls 2>/dev/null || echo "  (no agents running)" >&2; exit 1; }
+}
+
+# ── Worlds ───────────────────────────────────────────────────────────────────
+
+world_exists() {
+  local id="$1"
+  seed_worlds
+  awk -F'\t' -v id="$id" '$1 == id {found=1} END{exit !found}' "$WORLDS_FILE"
+}
+
+agent_world() {
+  local agent="$1"
+  [[ -f "$AGENT_WORLDS_FILE" ]] || { printf 'hq'; return; }
+  local w
+  w=$(awk -F'\t' -v a="$agent" '$1 == a {print $2; exit}' "$AGENT_WORLDS_FILE")
+  printf '%s' "${w:-hq}"
+}
+
+assign_agent_world() {
+  local agent="$1" world="$2"
+  ensure_dirs
+  seed_worlds
+  world_exists "$world" || { echo "Error: unknown world '$world'. Try: fleet world list" >&2; return 1; }
+  [[ -f "$AGENT_WORLDS_FILE" ]] || : > "$AGENT_WORLDS_FILE"
+  local tmp; tmp="$(mktemp)"
+  awk -F'\t' -v a="$agent" '$1 != a' "$AGENT_WORLDS_FILE" > "$tmp"
+  printf '%s\t%s\n' "$agent" "$world" >> "$tmp"
+  mv "$tmp" "$AGENT_WORLDS_FILE"
+}
+
+unassign_agent_world() {
+  local agent="$1"
+  [[ -f "$AGENT_WORLDS_FILE" ]] || return 0
+  local tmp; tmp="$(mktemp)"
+  awk -F'\t' -v a="$agent" '$1 != a' "$AGENT_WORLDS_FILE" > "$tmp"
+  mv "$tmp" "$AGENT_WORLDS_FILE"
+}
+
+# ── Chat ─────────────────────────────────────────────────────────────────────
+# chat.log lines: <unix_ts>\t<from>\t<to>\t<kind>\t<world>\t<text>
+
+derive_world() {
+  local from="$1" to="$2" w
+  if [[ "$to" == @* ]]; then printf '%s' "${to#@}"; return; fi
+  if [[ "$to" != "*" && -n "$to" ]]; then
+    w="$(agent_world "$to")"; [[ -n "$w" ]] && { printf '%s' "$w"; return; }
+  fi
+  if [[ "$from" != "me" && "$from" != "scheduler" && "$from" != "system" && -n "$from" ]]; then
+    w="$(agent_world "$from")"; [[ -n "$w" ]] && { printf '%s' "$w"; return; }
+  fi
+  printf 'hq'
+}
+
+chat_append() {
+  # chat_append <from> <to> <kind> <text> [<world>]
+  local from="$1" to="$2" kind="$3" text="$4" world="${5:-}"
+  ensure_dirs
+  [[ -z "$world" ]] && world="$(derive_world "$from" "$to")"
+  text="$(printf '%s' "$text" | tr '\t\n' '  ')"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$from" "$to" "$kind" "$world" "$text" >> "$CHAT_LOG"
+}
+
+events_append() {
+  local kind="$1" world="$2" text="$3"
+  ensure_dirs
+  text="$(printf '%s' "$text" | tr '\t\n' '  ')"
+  printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$kind" "$world" "$text" >> "$EVENTS_LOG"
+}
+
+# ── Schedules ────────────────────────────────────────────────────────────────
+
+parse_interval() {
+  local s="$1" n unit
+  if [[ "$s" =~ ^([0-9]+)([smhd]?)$ ]]; then
+    n="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+      ""|s) printf '%d' "$n" ;;
+      m)    printf '%d' $(( n * 60 )) ;;
+      h)    printf '%d' $(( n * 3600 )) ;;
+      d)    printf '%d' $(( n * 86400 )) ;;
+    esac
+  else
+    return 1
+  fi
+}
+
+human_interval() {
+  local s="$1"
+  if (( s >= 86400 )); then printf '%dd' $(( s / 86400 ))
+  elif (( s >= 3600 )); then printf '%dh' $(( s / 3600 ))
+  elif (( s >= 60 )); then printf '%dm' $(( s / 60 ))
+  else printf '%ds' "$s"; fi
+}
+
+schedule_upsert() {
+  local id="$1" agent="$2" interval_sec="$3" prompt="$4"
+  ensure_dirs
+  [[ -f "$SCHEDULES_FILE" ]] || : > "$SCHEDULES_FILE"
+  local tmp; tmp="$(mktemp)"
+  awk -F'\t' -v id="$id" '$1 != id' "$SCHEDULES_FILE" > "$tmp"
+  prompt="$(printf '%s' "$prompt" | tr '\t\n' '  ')"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$agent" "$interval_sec" "0" "1" "$prompt" >> "$tmp"
+  mv "$tmp" "$SCHEDULES_FILE"
+}
+
+schedule_remove() {
+  local id="$1"
+  [[ -f "$SCHEDULES_FILE" ]] || return 0
+  local tmp; tmp="$(mktemp)"
+  awk -F'\t' -v id="$id" '$1 != id' "$SCHEDULES_FILE" > "$tmp"
+  mv "$tmp" "$SCHEDULES_FILE"
+}
+
+scheduler_running() {
+  require_tmux
+  $TMUX_BIN has-session -t "$SCHED_SESSION" 2>/dev/null
+}
+
+scheduler_start() {
+  require_tmux
+  ensure_dirs
+  if scheduler_running; then echo "Scheduler already running."; return 0; fi
+  local sh="$SCRIPTS/scheduler.sh"
+  [[ -x "$sh" ]] || chmod +x "$sh" 2>/dev/null || true
+  $TMUX_BIN new-session -d -s "$SCHED_SESSION" \
+    "FLEET_HOME='$FLEET_HOME' FLEET_BIN='$(cd "$(dirname "$0")" && pwd)/fleet' '$sh'"
+  events_append "system" "hq" "scheduler online"
+  echo "Scheduler started (tmux session: $SCHED_SESSION)."
+}
+
+scheduler_stop() {
+  if scheduler_running; then
+    $TMUX_BIN kill-session -t "$SCHED_SESSION"
+    events_append "system" "hq" "scheduler offline"
+    echo "Scheduler stopped."
+  else
+    echo "Scheduler not running."
+  fi
+}
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+cmd_status() {
+  seed_worlds
+  echo "${BOLD}${CYAN}Fleet${RESET}  ${DIM}$(date '+%Y-%m-%d %H:%M')  ·  model: ${FLEET_MODEL}${RESET}"
+  echo
+
+  echo "${BOLD}WORLDS${RESET}"
+  awk -F'\t' '{ printf "  %-14s %s\n", $1, $2 }' "$WORLDS_FILE"
+  echo
+
+  echo "${BOLD}AGENTS${RESET}"
+  require_tmux
+  if $TMUX_BIN ls >/dev/null 2>&1; then
+    while IFS= read -r s; do
+      [[ -z "$s" || "$s" == "$SCHED_SESSION" ]] && continue
+      created=$($TMUX_BIN display-message -p -t "$s" '#{session_created}' 2>/dev/null || echo 0)
+      local w; w="$(agent_world "$s")"
+      printf '  %s●%s %-20s %s[%s]%s  %s%s%s\n' \
+        "$GREEN" "$RESET" "$s" "$DIM" "$w" "$RESET" "$DIM" "$(human_since "$created")" "$RESET"
+    done < <($TMUX_BIN ls -F '#{session_name}' 2>/dev/null)
+  else
+    echo "  ${DIM}none${RESET}"
+  fi
+  echo
+
+  echo "${BOLD}SCHEDULER${RESET}"
+  if scheduler_running; then
+    local n=0
+    [[ -f "$SCHEDULES_FILE" ]] && n=$(grep -c '^' "$SCHEDULES_FILE" 2>/dev/null || echo 0)
+    printf '  %srunning%s  %s%d schedule(s)%s\n' "$GREEN" "$RESET" "$DIM" "$n" "$RESET"
+  else
+    printf '  %sstopped%s   %sfleet scheduler start%s\n' "$YELLOW" "$RESET" "$DIM" "$RESET"
+  fi
+  echo
+
+  echo "${BOLD}INBOX${RESET}"
+  local log="$DATA/pending.log"
+  if [[ -f "$log" ]]; then
+    local total today last
+    total=$(wc -l < "$log" | tr -d ' ')
+    today=$(grep -cF "[$(date '+%Y-%m-%d')" "$log" || true)
+    last=$(tail -n1 "$log" 2>/dev/null || true)
+    printf '  total: %s   today: %s\n' "$total" "$today"
+    [[ -n "$last" ]] && printf '  %slast:%s %.80s\n' "$DIM" "$RESET" "$last"
+  else
+    echo "  ${DIM}empty${RESET}"
+  fi
+  echo
+
+  echo "${BOLD}DND${RESET}"
+  local rule; rule="$(dnd_rule)"
+  if [[ -z "$rule" ]]; then printf '  %salways on%s\n' "$GREEN" "$RESET"
+  elif dnd_active "$rule"; then printf '  %s%s — active now%s\n' "$YELLOW" "$rule" "$RESET"
+  else printf '  %s — inactive now\n' "$rule"; fi
+  echo
+  echo "${DIM}fleet new <name> <path> [--world <id>]   ·   fleet dashboard${RESET}"
+}
+
+cmd_new() {
+  seed_worlds
+  local session="${1:-}" project="${2:-}"
+  [[ -z "$session" || -z "$project" ]] && {
+    echo "Usage: fleet new <name> <path> [--world <id>]" >&2; exit 1; }
+  shift 2 || true
+
+  local world="hq"
+  if [[ "${1:-}" == "--world" ]]; then world="${2:-hq}"; shift 2 || true; fi
+
+  require_tmux
+  project="${project/#\~/$HOME}"
+  [[ -d "$project" ]] || { echo "Error: path not found: $project" >&2; exit 1; }
+  world_exists "$world" || { echo "Error: unknown world '$world'. Try: fleet world list" >&2; exit 1; }
+
+  if $TMUX_BIN has-session -t "$session" 2>/dev/null; then
+    echo "Session '$session' already exists.  fleet watch $session to attach."; exit 0; fi
+
+  [[ -f "$project/CLAUDE.md" ]] || echo "Warning: no CLAUDE.md in $project — agent starts without mission context." >&2
+
+  $TMUX_BIN new-session -d -s "$session" -c "$project"
+  $TMUX_BIN send-keys -t "$session" "claude --model $FLEET_MODEL" Enter
+  assign_agent_world "$session" "$world"
+  chat_append "system" "*" "system" "agent '$session' joined ${world} (model: $FLEET_MODEL)" "$world"
+  events_append "spawn" "$world" "$session joined"
+  echo "Agent '${session}' running in: ${project}  ${DIM}(world: ${world} · model: ${FLEET_MODEL})${RESET}"
+  echo "  Watch:  fleet watch ${session}"
+  echo "  Brief:  fleet tell ${session} \"your task\""
+}
+
+cmd_tell() {
+  local session="${1:-}" ; shift || true
+  [[ -z "$session" ]] && { echo "Usage: fleet tell <name> \"message\"" >&2; exit 1; }
+  require_session "$session" "fleet tell <name> \"message\""
+
+  local from="me"
+  if [[ "${1:-}" == "--from" ]]; then from="${2:-me}"; shift 2 || true; fi
+
+  local msg
+  if [[ "${1:-}" == "-" ]]; then msg="$(cat)"; else msg="$*"; fi
+  [[ -z "$msg" ]] && { echo "Error: message required." >&2; exit 1; }
+  $TMUX_BIN set-buffer -- "$msg"
+  $TMUX_BIN paste-buffer -t "$session"
+  $TMUX_BIN send-keys -t "$session" Enter
+  chat_append "$from" "$session" "tell" "$msg" "$(agent_world "$session")"
+  echo "→ $session: $msg"
+}
+
+cmd_say() {
+  local from="${1:-}" ; shift || true
+  [[ -z "$from" ]] && { echo "Usage: fleet say <from> [--to <agent>|--world <id>] \"message\"" >&2; exit 1; }
+  local to="*" world=""
+  if [[ "${1:-}" == "--to" ]]; then to="${2:-}"; shift 2 || true; fi
+  if [[ "${1:-}" == "--world" ]]; then world="${2:-}"; to="@${world}"; shift 2 || true; fi
+
+  local msg
+  if [[ "${1:-}" == "-" ]]; then msg="$(cat)"; else msg="$*"; fi
+  [[ -z "$msg" ]] && { echo "Error: message required." >&2; exit 1; }
+
+  if [[ "$to" == "*" ]]; then
+    chat_append "$from" "*" "say" "$msg" "hq"
+    echo "${MAGENTA}#chat${RESET} $from: $msg"
+  elif [[ "$to" == @* ]]; then
+    local w="${to#@}"
+    world_exists "$w" || { echo "Error: unknown world '$w'." >&2; exit 1; }
+    chat_append "$from" "$to" "say" "$msg" "$w"
+    echo "${MAGENTA}#${w}${RESET} $from: $msg"
+  else
+    require_session "$to" "fleet say <from> --to <agent> \"message\""
+    local payload="[from $from] $msg"
+    $TMUX_BIN set-buffer -- "$payload"
+    $TMUX_BIN paste-buffer -t "$to"
+    $TMUX_BIN send-keys -t "$to" Enter
+    chat_append "$from" "$to" "tell" "$msg" "$(agent_world "$to")"
+    echo "→ $to ${DIM}(from $from)${RESET}: $msg"
+  fi
+}
+
+cmd_chat() {
+  ensure_dirs
+  [[ -f "$CHAT_LOG" ]] || { echo "Chat empty."; return 0; }
+  local n="${1:-50}"
+  tail -n "$n" "$CHAT_LOG" | awk -F'\t' '
+    {
+      ts=$1; from=$2; to=$3; kind=$4
+      if (NF >= 6) { world=$5; text=$6 } else { world="-"; text=$5 }
+      cmd="date -r " ts " +%H:%M:%S"
+      cmd | getline t; close(cmd)
+      arrow = (to=="*") ? "→ all" : ("→ " to)
+      printf "  %s  [%-12s] %-12s %-16s  %s\n", t, world, from, arrow, text
+    }'
+}
+
+cmd_watch() {
+  local s="${1:-}"; require_session "$s" "fleet watch <name>"
+  exec $TMUX_BIN attach -t "$s"
+}
+
+cmd_log() {
+  local s="${1:-}" n="${2:-200}"; require_session "$s" "fleet log <name> [N]"
+  $TMUX_BIN capture-pane -t "$s" -p -S "-$n"
+}
+
+cmd_kill() {
+  local s="${1:-}"; require_session "$s" "fleet kill <name>"
+  local w; w="$(agent_world "$s")"
+  $TMUX_BIN kill-session -t "$s" && {
+    chat_append "system" "*" "system" "agent '$s' stopped" "$w"
+    events_append "kill" "$w" "$s left"
+    unassign_agent_world "$s"
+    echo "Agent '$s' stopped."
+  }
+}
+
+cmd_list() {
+  require_tmux
+  $TMUX_BIN ls 2>/dev/null || echo "No agents running."
+}
+
+cmd_pending() {
+  local arg="${1:-}" log="$DATA/pending.log"
+  mkdir -p "$DATA"
+  case "$arg" in
+    clear) : > "$log"; echo "Inbox cleared." ;;
+    today) grep -F "[$(date '+%Y-%m-%d')" "$log" 2>/dev/null || echo "Nothing today." ;;
+    *)
+      [[ -f "$log" && -s "$log" ]] && cat "$log" || echo "Inbox empty." ;;
+  esac
+}
+
+cmd_dnd() {
+  local arg="${1:-}" conf="$CONFIG/dnd.conf"
+  mkdir -p "$CONFIG"
+  case "$arg" in
+    "")
+      local rule; rule="$(dnd_rule)"
+      if [[ -z "$rule" ]]; then echo "DND: always on."
+      elif dnd_active "$rule"; then echo "DND: $rule — ${YELLOW}active now${RESET}."
+      else echo "DND: $rule — inactive."; fi ;;
+    on)   printf 'OFF\n' > "$conf"; echo "DND on: total silence." ;;
+    off)  : > "$conf"; echo "DND off: always on." ;;
+    *-*)  printf '%s\n' "$arg" > "$conf"; echo "DND window: $arg." ;;
+    *)    echo "Usage: fleet dnd [on|off|HH:MM-HH:MM]" >&2; exit 1 ;;
+  esac
+}
+
+cmd_dashboard() {
+  seed_worlds
+  local port="${1:-4242}"
+  local node_bin; node_bin=$(command -v node 2>/dev/null || echo "node")
+  echo "${CYAN}Fleet HQ${RESET} → http://localhost:${port}"
+  echo "${DIM}Ctrl+C to stop${RESET}"
+  FLEET_HOME="$FLEET_HOME" PORT="$port" FLEET_BIN="$(cd "$(dirname "$0")" && pwd)/fleet" \
+    "$node_bin" "$DASHBOARD_DIR/server.js"
+}
+
+cmd_notify() {
+  local agent="${1:-unknown}" msg="${2:-}"
+  [[ -z "$msg" ]] && { echo "Usage: fleet notify <agent> \"message\"" >&2; exit 1; }
+  mkdir -p "$DATA"
+  printf '[%s] %s: %s\n' "$(date '+%Y-%m-%d %H:%M')" "$agent" "$msg" >> "$DATA/pending.log"
+  local w; w="$(agent_world "$agent")"
+  chat_append "$agent" "*" "notify" "$msg" "$w"
+  events_append "notify" "$w" "$agent: $msg"
+}
+
+cmd_tokens() { "$SCRIPTS/tokens.sh" "$@"; }
+
+# ── Asks (agents requesting human input) ─────────────────────────────────
+# asks.tsv lines:
+#   <id>\t<ts>\t<agent>\t<world>\t<status>\t<answered_ts>\t<question>\t<answer>
+#   status ∈ { open, answered, dismissed }
+
+asks_next_id() {
+  # ts-based id with a 4-digit random suffix, ensures uniqueness across procs
+  printf 'ask-%s-%04d' "$(date +%s)" $((RANDOM % 10000))
+}
+
+cmd_ask() {
+  # fleet ask <agent> "question"
+  local agent="${1:-}" ; shift || true
+  [[ -z "$agent" ]] && {
+    cat <<EOF >&2
+Usage: fleet ask <agent> "question"
+  Agents call this when they need a human decision.
+  The dashboard surfaces it with sound + push notification.
+
+Examples:
+  fleet ask lead-scout "Should I include vendors from US too?"
+  fleet ask dropship-pricer "Approve markup of 35% for this batch?"
+EOF
+    exit 1
+  }
+  local q
+  if [[ "${1:-}" == "-" ]]; then q="$(cat)"; else q="$*"; fi
+  [[ -z "$q" ]] && { echo "Error: question required." >&2; exit 1; }
+  ensure_dirs
+  [[ -f "$ASKS_FILE" ]] || : > "$ASKS_FILE"
+  local id w now
+  id="$(asks_next_id)"; w="$(agent_world "$agent")"; now="$(date +%s)"
+  q="$(printf '%s' "$q" | tr '\t\n' '  ')"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$id" "$now" "$agent" "$w" "open" "0" "$q" "" >> "$ASKS_FILE"
+  events_append "ask" "$w" "$agent asks: $q"
+  chat_append "$agent" "me" "ask" "❓ $q" "$w"
+  echo "❓ Ask logged ($id) — agent: $agent · world: $w"
+}
+
+cmd_asks() {
+  ensure_dirs
+  [[ -f "$ASKS_FILE" ]] || { echo "No asks."; return 0; }
+  local filter="${1:-open}"
+  echo "${BOLD}Asks${RESET}  ${DIM}(filter: $filter)${RESET}"
+  awk -F'\t' -v f="$filter" '
+    f == "all" || $5 == f {
+      cmd="date -r " $2 " +%FT%R"; cmd | getline t; close(cmd)
+      printf "  %s  %-14s %-10s %-9s %s\n", t, $1, $4, $5, $7
+    }' "$ASKS_FILE"
+}
+
+cmd_answer() {
+  # fleet answer <id> "<answer>"   — replies to an ask, tells the agent, marks answered
+  local id="${1:-}" ; shift || true
+  [[ -z "$id" ]] && { echo "Usage: fleet answer <id> \"<answer>\"" >&2; exit 1; }
+  local ans
+  if [[ "${1:-}" == "-" ]]; then ans="$(cat)"; else ans="$*"; fi
+  [[ -z "$ans" ]] && { echo "Error: answer required." >&2; exit 1; }
+  [[ -f "$ASKS_FILE" ]] || { echo "Error: no asks logged." >&2; exit 1; }
+
+  # Locate the ask row
+  local row; row=$(awk -F'\t' -v id="$id" '$1 == id {print; exit}' "$ASKS_FILE")
+  [[ -z "$row" ]] && { echo "Error: ask '$id' not found." >&2; exit 1; }
+  local agent w
+  agent=$(printf '%s' "$row" | awk -F'\t' '{print $3}')
+  w=$(printf '%s' "$row" | awk -F'\t' '{print $4}')
+
+  # Deliver the answer to the agent via tell
+  require_session "$agent" "fleet answer <id> \"<answer>\""
+  local payload="[answer to your question] $ans"
+  $TMUX_BIN set-buffer -- "$payload"
+  $TMUX_BIN paste-buffer -t "$agent"
+  $TMUX_BIN send-keys -t "$agent" Enter
+
+  # Rewrite the ask row with status=answered + answer
+  local tmp; tmp="$(mktemp)"
+  ans="$(printf '%s' "$ans" | tr '\t\n' '  ')"
+  awk -F'\t' -v id="$id" -v now="$(date +%s)" -v ans="$ans" '
+    BEGIN{OFS="\t"}
+    $1 == id { $5="answered"; $6=now; $8=ans }
+    {print}
+  ' "$ASKS_FILE" > "$tmp"
+  mv "$tmp" "$ASKS_FILE"
+
+  chat_append "me" "$agent" "tell" "$ans" "$w"
+  events_append "answer" "$w" "answered $id ($agent)"
+  echo "✓ Answered $id → $agent."
+}
+
+cmd_dismiss() {
+  local id="${1:-}"
+  [[ -z "$id" ]] && { echo "Usage: fleet dismiss <id>" >&2; exit 1; }
+  [[ -f "$ASKS_FILE" ]] || return 0
+  local tmp; tmp="$(mktemp)"
+  awk -F'\t' -v id="$id" 'BEGIN{OFS="\t"} $1 == id { $5="dismissed" } {print}' \
+    "$ASKS_FILE" > "$tmp"
+  mv "$tmp" "$ASKS_FILE"
+  events_append "answer" "hq" "dismissed $id"
+  echo "× Dismissed $id."
+}
+
+# ── Revenue ──────────────────────────────────────────────────────────────────
+# revenue.tsv lines: <unix_ts>\t<agent>\t<world>\t<amount>\t<note>
+
+cmd_earn() {
+  # fleet earn <agent> <amount> ["note"]
+  local agent="${1:-}" amount="${2:-}" ; shift 2 2>/dev/null || true
+  local note="${*:-}"
+  if [[ -z "$agent" || -z "$amount" ]]; then
+    cat <<EOF >&2
+Usage: fleet earn <agent> <amount> ["note"]
+Examples:
+  fleet earn lead-scout 49.00 "annual plan signup — customer #142"
+  fleet earn dropship-pricer 12.50 "order #88231"
+  fleet earn me 2500 "monthly retainer from Acme"
+EOF
+    exit 1
+  fi
+  # Accept "$49.00", "49,00", "49.00 EUR" — strip to a decimal number
+  amount="${amount//,/.}"
+  amount="${amount//$/}"
+  if [[ ! "$amount" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "Error: amount must be a number (e.g. 49.00)." >&2; exit 1
+  fi
+  ensure_dirs
+  [[ -f "$REVENUE_FILE" ]] || : > "$REVENUE_FILE"
+  local w; w="$(agent_world "$agent")"
+  note="$(printf '%s' "$note" | tr '\t\n' '  ')"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$agent" "$w" "$amount" "$note" >> "$REVENUE_FILE"
+  events_append "earn" "$w" "${agent} earned \$${amount}${note:+ — $note}"
+  chat_append "system" "*" "system" "💰 ${agent} earned \$${amount}${note:+ — $note}" "$w"
+  echo "💰 Logged: ${agent} → \$${amount}${note:+ — $note}  ${DIM}(world: ${w})${RESET}"
+}
+
+cmd_revenue() {
+  # fleet revenue [N=30]  — list recent earnings
+  ensure_dirs
+  if [[ ! -f "$REVENUE_FILE" || ! -s "$REVENUE_FILE" ]]; then
+    echo "No revenue yet. ${DIM}fleet earn <agent> <amount> [note]${RESET}"; return 0
+  fi
+  local n="${1:-30}"
+  echo "${BOLD}Revenue${RESET}"
+  tail -n "$n" "$REVENUE_FILE" | awk -F'\t' '
+    { cmd="date -r " $1 " +%FT%R"; cmd | getline t; close(cmd)
+      total += $4
+      printf "  %s  %-18s [%-14s] $%-10s %s\n", t, $2, $3, $4, $5 }
+    END { printf "\n  TOTAL: $%.2f\n", total }'
+}
+
+# ── Schedule commands ────────────────────────────────────────────────────────
+
+cmd_schedule() {
+  local id="${1:-}" agent="${2:-}" every="${3:-}"
+  if [[ -z "$id" || -z "$agent" || -z "$every" ]]; then
+    cat <<EOF >&2
+Usage: fleet schedule <id> <agent> <every> "prompt"
+  <every> ::= <n><s|m|h|d>     e.g.  30m, 2h, 45s, 1d
+EOF
+    exit 1
+  fi
+  shift 3 || true
+  local prompt="$*"
+  [[ -z "$prompt" ]] && { echo "Error: prompt required." >&2; exit 1; }
+  local sec
+  sec=$(parse_interval "$every") || { echo "Error: bad interval '$every'." >&2; exit 1; }
+  (( sec < 30 )) && { echo "Error: interval must be ≥ 30s." >&2; exit 1; }
+  schedule_upsert "$id" "$agent" "$sec" "$prompt"
+  events_append "schedule" "$(agent_world "$agent")" "scheduled '$id' → $agent every $(human_interval "$sec")"
+  echo "Scheduled '${id}' → ${agent} every $(human_interval "$sec")."
+  if ! scheduler_running; then
+    echo "  ${DIM}Scheduler is not running. Start it with:${RESET} fleet scheduler start"
+  fi
+}
+
+cmd_unschedule() {
+  local id="${1:-}"
+  [[ -z "$id" ]] && { echo "Usage: fleet unschedule <id>" >&2; exit 1; }
+  schedule_remove "$id"
+  events_append "schedule" "hq" "unscheduled '$id'"
+  echo "Removed schedule '$id'."
+}
+
+cmd_schedules() {
+  if [[ ! -f "$SCHEDULES_FILE" || ! -s "$SCHEDULES_FILE" ]]; then
+    echo "No schedules. ${DIM}fleet schedule <id> <agent> <every> \"prompt\"${RESET}"; return 0
+  fi
+  echo "${BOLD}Schedules${RESET}"
+  awk -F'\t' '{
+    next_in = ($4 == 0) ? "—" : ($4 + $3) - systime()
+    if (next_in == "—") nxt = "—"
+    else if (next_in <= 0) nxt = "now"
+    else if (next_in >= 86400) nxt = int(next_in/86400) "d"
+    else if (next_in >= 3600)  nxt = int(next_in/3600)  "h"
+    else if (next_in >= 60)    nxt = int(next_in/60)    "m"
+    else                       nxt = next_in            "s"
+    every = ($3 >= 86400) ? int($3/86400) "d" \
+          : ($3 >= 3600)  ? int($3/3600)  "h" \
+          : ($3 >= 60)    ? int($3/60)    "m" \
+          :                 $3            "s"
+    state = ($5 == "1") ? "●" : "○"
+    printf "  %s  %-18s → %-14s every %-5s  next %s\n", state, $1, $2, every, nxt
+  }' "$SCHEDULES_FILE"
+}
+
+cmd_scheduler() {
+  local arg="${1:-status}"
+  case "$arg" in
+    start)   scheduler_start ;;
+    stop)    scheduler_stop ;;
+    restart) scheduler_stop || true; scheduler_start ;;
+    status)
+      if scheduler_running; then echo "Scheduler: ${GREEN}running${RESET}."
+      else echo "Scheduler: ${YELLOW}stopped${RESET}."; fi ;;
+    *) echo "Usage: fleet scheduler [start|stop|restart|status]" >&2; exit 1 ;;
+  esac
+}
+
+# ── World commands ──────────────────────────────────────────────────────────
+
+cmd_world() {
+  seed_worlds
+  local sub="${1:-list}"; shift || true
+  case "$sub" in
+    list|ls)
+      echo "${BOLD}WORLDS${RESET}"
+      awk -F'\t' '{ printf "  %-14s  %-22s  %-8s  %s\n", $1, $2, $6, $7 }' "$WORLDS_FILE"
+      ;;
+    add)
+      local id="${1:-}" name="${2:-}" icon="${3:-globe}" color="${4:-#84C7AE}" theme="${5:-grid}" kind="${6:-revenue}" desc="${7:-}"
+      [[ -z "$id" || -z "$name" ]] && { echo "Usage: fleet world add <id> <name> [icon] [color] [theme] [kind=revenue] [description]" >&2; exit 1; }
+      world_exists "$id" && { echo "World '$id' already exists." >&2; exit 1; }
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$name" "$icon" "$color" "$theme" "$kind" "$desc" >> "$WORLDS_FILE"
+      events_append "world" "$id" "world '$name' created"
+      echo "World '$id' added."
+      ;;
+    rm|remove)
+      local id="${1:-}"
+      [[ -z "$id" ]] && { echo "Usage: fleet world rm <id>" >&2; exit 1; }
+      [[ "$id" == "hq" ]] && { echo "Refusing to remove HQ." >&2; exit 1; }
+      local tmp; tmp="$(mktemp)"
+      awk -F'\t' -v id="$id" '$1 != id' "$WORLDS_FILE" > "$tmp"
+      mv "$tmp" "$WORLDS_FILE"
+      echo "World '$id' removed (agents fall back to HQ)."
+      ;;
+    assign)
+      local agent="${1:-}" world="${2:-}"
+      [[ -z "$agent" || -z "$world" ]] && { echo "Usage: fleet world assign <agent> <world>" >&2; exit 1; }
+      assign_agent_world "$agent" "$world"
+      events_append "assign" "$world" "$agent assigned to $world"
+      chat_append "system" "$agent" "system" "moved to $world" "$world"
+      echo "Agent '$agent' → world '$world'."
+      ;;
+    *)
+      echo "Usage: fleet world [list|add|rm|assign]" >&2; exit 1 ;;
+  esac
+}
+
+cmd_assign() { cmd_world assign "$@"; }
+
+cmd_events() {
+  ensure_dirs
+  [[ -f "$EVENTS_LOG" ]] || { echo "No events."; return 0; }
+  local n="${1:-30}"
+  tail -n "$n" "$EVENTS_LOG" | awk -F'\t' '
+    { cmd="date -r " $1 " +%H:%M:%S"; cmd | getline t; close(cmd)
+      printf "  %s  %-10s [%-14s] %s\n", t, $2, $3, $4 }'
+}
+
+# ── Ventures (Etsy stores / YouTube channels / Fiverr gigs / etc.) ───────────
+# ventures.tsv: <id>\t<world>\t<type>\t<name>\t<url>\t<monthly_target>\t<status>\t<created_ts>
+
+slug() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+    | sed -e 's/[^a-z0-9]/-/g' -e 's/--*/-/g' -e 's/^-//; s/-$//'
+}
+
+cmd_venture() {
+  local sub="${1:-list}"; shift || true
+  ensure_dirs
+  [[ -f "$VENTURES_FILE" ]] || : > "$VENTURES_FILE"
+  case "$sub" in
+    list|ls)
+      local w="${1:-}"
+      if [[ ! -s "$VENTURES_FILE" ]]; then echo "No ventures. ${DIM}fleet venture add <world> <name>${RESET}"; return 0; fi
+      echo "${BOLD}Ventures${RESET}"
+      awk -F'\t' -v w="$w" 'w=="" || $2==w {
+        printf "  %s%-7s%s  %-14s  %-22s  → %s\n", "'"$DIM"'", $7, "'"$RESET"'", $2, $4, $5
+      }' "$VENTURES_FILE"
+      ;;
+    add)
+      local world="${1:-}" ; shift || true
+      local name="${1:-}"  ; shift || true
+      local url="${1:-}"   ; [[ -n "${1:-}" ]] && shift || true
+      local target="${1:-0}"
+      [[ -z "$world" || -z "$name" ]] && { echo "Usage: fleet venture add <world> <name> [url] [monthly_target]" >&2; exit 1; }
+      world_exists "$world" || { echo "Error: unknown world '$world'." >&2; exit 1; }
+      local id; id="$(slug "$name")"
+      local type
+      case "$world" in
+        etsy)        type="store" ;;
+        youtube)     type="channel" ;;
+        fiverr)      type="gig" ;;
+        ai-dropship) type="store" ;;
+        *)           type="project" ;;
+      esac
+      local now; now="$(date +%s)"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$id" "$world" "$type" "$name" "$url" "$target" "idea" "$now" >> "$VENTURES_FILE"
+      events_append "venture" "$world" "new ${type}: ${name}"
+      echo "✓ Venture '${name}' (${type}) added to ${world}."
+      ;;
+    rm|remove)
+      local id="${1:-}"
+      [[ -z "$id" ]] && { echo "Usage: fleet venture rm <id>" >&2; exit 1; }
+      local tmp; tmp="$(mktemp)"
+      awk -F'\t' -v id="$id" '$1 != id' "$VENTURES_FILE" > "$tmp"
+      mv "$tmp" "$VENTURES_FILE"
+      echo "× Removed venture '$id'."
+      ;;
+    update)
+      local id="${1:-}" field="${2:-}" value="${3:-}"
+      [[ -z "$id" || -z "$field" || -z "$value" ]] && {
+        echo "Usage: fleet venture update <id> <field> <value>
+  fields: name | url | monthly_target | status
+  status values: idea | building | live | paused | archived" >&2; exit 1; }
+      local col
+      case "$field" in
+        name)            col=4 ;;
+        url)             col=5 ;;
+        monthly_target)  col=6 ;;
+        status)          col=7 ;;
+        *) echo "Error: unknown field '$field'." >&2; exit 1 ;;
+      esac
+      local tmp; tmp="$(mktemp)"
+      value="$(printf '%s' "$value" | tr '\t\n' '  ')"
+      awk -F'\t' -v id="$id" -v col="$col" -v v="$value" \
+        'BEGIN{OFS="\t"} $1==id { $col=v } {print}' "$VENTURES_FILE" > "$tmp"
+      mv "$tmp" "$VENTURES_FILE"
+      echo "✓ Updated $id.$field = $value"
+      ;;
+    *) echo "Usage: fleet venture [list|add|rm|update]" >&2; exit 1 ;;
+  esac
+}
+
+# ── Goal (monthly $ target) ──────────────────────────────────────────────────
+cmd_goal() {
+  local sub="${1:-show}"
+  case "$sub" in
+    show|"")
+      [[ -f "$GOAL_FILE" ]] || { echo "No goal set. ${DIM}fleet goal set <amount>${RESET}"; return 0; }
+      cat "$GOAL_FILE"
+      ;;
+    set)
+      local amount="${2:-}"
+      [[ -z "$amount" ]] && { echo "Usage: fleet goal set <amount>" >&2; exit 1; }
+      amount="${amount//,/.}"; amount="${amount//$/}"
+      [[ ! "$amount" =~ ^[0-9]+(\.[0-9]+)?$ ]] && { echo "Error: amount must be a number." >&2; exit 1; }
+      ensure_dirs
+      local month; month="$(date +%Y-%m)"
+      printf 'month=%s\ntarget=%s\n' "$month" "$amount" > "$GOAL_FILE"
+      echo "✓ Goal set: \$${amount} for ${month}"
+      ;;
+    clear)
+      rm -f "$GOAL_FILE"; echo "Goal cleared."
+      ;;
+    *) echo "Usage: fleet goal [show|set <amount>|clear]" >&2; exit 1 ;;
+  esac
+}
+
+# ── Propose / Approve queue ──────────────────────────────────────────────────
+# proposals.tsv: <id>\t<ts>\t<agent>\t<world>\t<status>\t<decided_ts>\t<action>\t<note>
+
+cmd_propose() {
+  local agent="${1:-}" ; shift || true
+  [[ -z "$agent" ]] && { echo "Usage: fleet propose <agent> \"<action>\"" >&2; exit 1; }
+  local action
+  if [[ "${1:-}" == "-" ]]; then action="$(cat)"; else action="$*"; fi
+  [[ -z "$action" ]] && { echo "Error: action required." >&2; exit 1; }
+  ensure_dirs
+  [[ -f "$PROPOSALS_FILE" ]] || : > "$PROPOSALS_FILE"
+  local id w now
+  id="prop-$(date +%s)-$((RANDOM % 10000))"; w="$(agent_world "$agent")"; now="$(date +%s)"
+  action="$(printf '%s' "$action" | tr '\t\n' '  ')"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$id" "$now" "$agent" "$w" "pending" "0" "$action" "" >> "$PROPOSALS_FILE"
+  events_append "propose" "$w" "$agent proposes: $action"
+  chat_append "$agent" "me" "propose" "⚙ $action" "$w"
+  echo "⚙ Proposal logged ($id) — needs your approval."
+}
+
+cmd_approve() {
+  local id="${1:-}" ; shift || true
+  [[ -z "$id" ]] && { echo "Usage: fleet approve <id> [note]" >&2; exit 1; }
+  local note="$*"
+  [[ -f "$PROPOSALS_FILE" ]] || { echo "No proposals." >&2; exit 1; }
+  local row; row=$(awk -F'\t' -v id="$id" '$1 == id {print; exit}' "$PROPOSALS_FILE")
+  [[ -z "$row" ]] && { echo "Error: proposal '$id' not found." >&2; exit 1; }
+  local agent w
+  agent=$(printf '%s' "$row" | awk -F'\t' '{print $3}')
+  w=$(printf '%s' "$row" | awk -F'\t' '{print $4}')
+  require_session "$agent" "fleet approve <id>"
+  local payload="[approved] ${note:-go ahead}"
+  $TMUX_BIN set-buffer -- "$payload"
+  $TMUX_BIN paste-buffer -t "$agent"
+  $TMUX_BIN send-keys -t "$agent" Enter
+  local tmp; tmp="$(mktemp)"
+  note="$(printf '%s' "$note" | tr '\t\n' '  ')"
+  awk -F'\t' -v id="$id" -v now="$(date +%s)" -v note="$note" \
+    'BEGIN{OFS="\t"} $1==id { $5="approved"; $6=now; $8=note } {print}' \
+    "$PROPOSALS_FILE" > "$tmp"
+  mv "$tmp" "$PROPOSALS_FILE"
+  chat_append "me" "$agent" "tell" "approved: ${note:-go ahead}" "$w"
+  events_append "approve" "$w" "approved $id"
+  echo "✓ Approved $id → $agent."
+}
+
+cmd_reject() {
+  local id="${1:-}" ; shift || true
+  [[ -z "$id" ]] && { echo "Usage: fleet reject <id> [reason]" >&2; exit 1; }
+  local reason="$*"
+  [[ -f "$PROPOSALS_FILE" ]] || { echo "No proposals." >&2; exit 1; }
+  local row; row=$(awk -F'\t' -v id="$id" '$1 == id {print; exit}' "$PROPOSALS_FILE")
+  [[ -z "$row" ]] && { echo "Error: proposal '$id' not found." >&2; exit 1; }
+  local agent w
+  agent=$(printf '%s' "$row" | awk -F'\t' '{print $3}')
+  w=$(printf '%s' "$row" | awk -F'\t' '{print $4}')
+  if $TMUX_BIN has-session -t "$agent" 2>/dev/null; then
+    local payload="[rejected] ${reason:-do not proceed}"
+    $TMUX_BIN set-buffer -- "$payload"
+    $TMUX_BIN paste-buffer -t "$agent"
+    $TMUX_BIN send-keys -t "$agent" Enter
+  fi
+  local tmp; tmp="$(mktemp)"
+  reason="$(printf '%s' "$reason" | tr '\t\n' '  ')"
+  awk -F'\t' -v id="$id" -v now="$(date +%s)" -v r="$reason" \
+    'BEGIN{OFS="\t"} $1==id { $5="rejected"; $6=now; $8=r } {print}' \
+    "$PROPOSALS_FILE" > "$tmp"
+  mv "$tmp" "$PROPOSALS_FILE"
+  chat_append "me" "$agent" "tell" "rejected: ${reason:-do not proceed}" "$w"
+  events_append "reject" "$w" "rejected $id"
+  echo "× Rejected $id → $agent."
+}
+
+cmd_proposals() {
+  ensure_dirs
+  [[ -f "$PROPOSALS_FILE" ]] || { echo "No proposals."; return 0; }
+  local filter="${1:-pending}"
+  echo "${BOLD}Proposals${RESET}  ${DIM}(filter: $filter)${RESET}"
+  awk -F'\t' -v f="$filter" '
+    f == "all" || $5 == f {
+      cmd="date -r " $2 " +%FT%R"; cmd | getline t; close(cmd)
+      printf "  %s  %-22s %-12s %-10s %s\n", t, $1, $3, $5, $7
+    }' "$PROPOSALS_FILE"
+}
+
+# ── Spawn (no-code agent creation) ───────────────────────────────────────────
+# fleet spawn <name> <world> [--template <key>] [--mission "<text>"] [--path <dir>]
+# Creates agents/<name>/CLAUDE.md with the mission, launches the session, assigns to world.
+
+cmd_spawn() {
+  local name="${1:-}" world="${2:-}"
+  [[ -z "$name" || -z "$world" ]] && {
+    echo "Usage: fleet spawn <name> <world> [--template <key>] [--mission \"<text>\"] [--path <dir>]" >&2; exit 1; }
+  shift 2 || true
+
+  local template="" mission="" custom_path=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --template) template="$2"; shift 2 ;;
+      --mission)  mission="$2";  shift 2 ;;
+      --path)     custom_path="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  seed_worlds
+  world_exists "$world" || { echo "Error: unknown world '$world'." >&2; exit 1; }
+  name="$(slug "$name")"
+  [[ -z "$name" ]] && { echo "Error: invalid name." >&2; exit 1; }
+
+  local proj="${custom_path:-$HOME/agents/$name}"
+  proj="${proj/#\~/$HOME}"
+  mkdir -p "$proj"
+
+  # Resolve mission text — every agent gets the shared preamble + the template
+  local preamble=""
+  [[ -f "$TEMPLATES_DIR/_preamble.md" ]] && preamble="$(cat "$TEMPLATES_DIR/_preamble.md")"
+
+  local body=""
+  if [[ -n "$mission" ]]; then
+    body="$mission"
+  elif [[ -n "$template" ]]; then
+    local tpath="$TEMPLATES_DIR/$template.md"
+    [[ -f "$tpath" ]] && body="$(cat "$tpath")"
+  fi
+  [[ -z "$body" ]] && body="# ${name}
+
+## Mission
+Describe what this agent produces each cycle.
+
+## Cadence
+This agent runs continuously. Each scheduled prompt = one bounded cycle.
+
+## Output
+Append to ${name}-log.md.
+"
+
+  # Strip leading '# [Agent Name]' from preamble — agents pick their own H1
+  # via the template body. The preamble starts after its frontmatter line.
+  local preamble_clean; preamble_clean="$(printf '%s' "$preamble" | sed '1{/^# \[Agent Name\]/d;}')"
+
+  {
+    printf '# %s\n\n' "$name"
+    [[ -n "$preamble_clean" ]] && printf '%s\n\n' "$preamble_clean"
+    # Strip the first H1 from body too (we just wrote our own)
+    printf '%s\n' "$body" | sed '1{/^#[^#]/d;}'
+  } > "$proj/CLAUDE.md"
+
+  # Launch via cmd_new logic
+  require_tmux
+  if $TMUX_BIN has-session -t "$name" 2>/dev/null; then
+    echo "Agent '$name' already running."; assign_agent_world "$name" "$world"; return 0
+  fi
+  $TMUX_BIN new-session -d -s "$name" -c "$proj"
+  $TMUX_BIN send-keys -t "$name" "claude --model $FLEET_MODEL" Enter
+  assign_agent_world "$name" "$world"
+  chat_append "system" "*" "system" "agent '$name' joined ${world} via spawn" "$world"
+  events_append "spawn" "$world" "$name joined ($proj)"
+  echo "✓ Spawned '$name' in '$world' at $proj"
+}
+
+cmd_templates() {
+  if [[ ! -d "$TEMPLATES_DIR" ]]; then echo "No templates directory."; return 0; fi
+  echo "${BOLD}Mission templates${RESET}  ${DIM}($TEMPLATES_DIR)${RESET}"
+  find "$TEMPLATES_DIR" -name '*.md' -type f 2>/dev/null | sort | while read -r f; do
+    local key; key="${f#$TEMPLATES_DIR/}"; key="${key%.md}"
+    local first; first=$(head -1 "$f" | sed 's/^#\s*//')
+    printf '  %-32s  %s\n' "$key" "$first"
+  done
+}
+
+cmd_help() { cat <<EOF
+${BOLD}Fleet${RESET} — multi-world fleet of Claude agents
+
+${BOLD}AGENTS${RESET}
+  ${CYAN}status${RESET} (s)                       Overview + worlds
+  ${CYAN}new${RESET} <name> <path> [--world <id>] Launch an agent into a world
+  ${CYAN}tell${RESET} <name> "instruction"        Brief an agent
+  ${CYAN}watch${RESET} <name>                     Attach to a session
+  ${CYAN}log${RESET} <name> [N]                   Show last N lines
+  ${CYAN}kill${RESET} <name>                      Stop an agent
+  ${CYAN}list${RESET} (ls)                        List running agents
+  ${CYAN}tokens${RESET} [name|all] [--json]       Token usage + cost per agent
+
+${BOLD}WORLDS${RESET}
+  ${CYAN}world list${RESET}                       List worlds
+  ${CYAN}world add${RESET} <id> <name> [emoji] [color] [theme] [desc]
+  ${CYAN}world rm${RESET} <id>                    Remove a world (except HQ)
+  ${CYAN}world assign${RESET} <agent> <world>     Move an agent
+  ${CYAN}assign${RESET} <agent> <world>           Shortcut
+
+${BOLD}CHAT${RESET}
+  ${CYAN}say${RESET} <from> "msg"                 Broadcast (HQ scope)
+  ${CYAN}say${RESET} <from> --to <agent> "msg"    Direct, delivers via tell + logs
+  ${CYAN}say${RESET} <from> --world <id> "msg"    Broadcast inside a world
+  ${CYAN}chat${RESET} [N]                         Last N chat lines (all worlds)
+  ${CYAN}events${RESET} [N]                       Last N events
+
+${BOLD}CONTINUOUS WORK${RESET}
+  ${CYAN}schedule${RESET} <id> <agent> <every> "prompt"
+  ${CYAN}unschedule${RESET} <id>
+  ${CYAN}schedules${RESET}
+  ${CYAN}scheduler${RESET} [start|stop|status]
+
+${BOLD}REVENUE${RESET}
+  ${CYAN}earn${RESET} <agent> <amount> [note]    Log earnings (\$ that flowed in)
+  ${CYAN}revenue${RESET} [N]                     List recent earnings
+
+${BOLD}ASKS (agents ↔ you)${RESET}
+  ${CYAN}ask${RESET} <agent> "question"          Agent asks you something — dashboard alerts
+  ${CYAN}asks${RESET} [open|answered|all]        List asks
+  ${CYAN}answer${RESET} <id> "<answer>"          Reply to an ask (delivers via tell)
+  ${CYAN}dismiss${RESET} <id>                    Mark an ask as dismissed
+
+${BOLD}NOTIFICATIONS${RESET}
+  ${CYAN}pending${RESET} [today|clear]
+  ${CYAN}dnd${RESET} [on|off|HH:MM-HH:MM]
+  ${CYAN}notify${RESET} <agent> "message"
+
+${BOLD}DASHBOARD${RESET}
+  ${CYAN}dashboard${RESET} (hq) [port=4242]      Open Fleet HQ live UI
+
+${BOLD}EXAMPLES${RESET}
+  fleet new scout1 ~/projects/sage-sum --world sage-sum
+  fleet schedule lead-pulse scout1 30m "Find 5 new EU SaaS leads."
+  fleet say me --world research "team: prioritise EU markets"
+  fleet say me --to scout1 "switch to Stripe alternatives"
+  fleet dashboard
+EOF
+}
+
+# ── Dispatch ─────────────────────────────────────────────────────────────────
+[[ $# -eq 0 ]] && { cmd_status; exit 0; }
+cmd="$1"; shift
+case "$cmd" in
+  status|s)              cmd_status "$@" ;;
+  new|start)             cmd_new "$@" ;;
+  tell|send)             cmd_tell "$@" ;;
+  watch|attach)          cmd_watch "$@" ;;
+  log|history)           cmd_log "$@" ;;
+  kill|stop)             cmd_kill "$@" ;;
+  list|ls)               cmd_list "$@" ;;
+  pending|inbox)         cmd_pending "$@" ;;
+  dnd)                   cmd_dnd "$@" ;;
+  dashboard|dash|ui|hq)  cmd_dashboard "$@" ;;
+  tokens|usage|cost)     cmd_tokens "$@" ;;
+  notify)                cmd_notify "$@" ;;
+  say)                   cmd_say "$@" ;;
+  chat)                  cmd_chat "$@" ;;
+  schedule)              cmd_schedule "$@" ;;
+  unschedule)            cmd_unschedule "$@" ;;
+  schedules)             cmd_schedules "$@" ;;
+  scheduler)             cmd_scheduler "$@" ;;
+  watcher)               "$SCRIPTS/watcher.sh" "$@" ;;
+  world|worlds)          cmd_world "$@" ;;
+  assign)                cmd_assign "$@" ;;
+  events)                cmd_events "$@" ;;
+  earn|earned)           cmd_earn "$@" ;;
+  revenue|earnings)      cmd_revenue "$@" ;;
+  ask)                   cmd_ask "$@" ;;
+  asks)                  cmd_asks "$@" ;;
+  answer|reply)          cmd_answer "$@" ;;
+  dismiss)               cmd_dismiss "$@" ;;
+  venture|ventures)      cmd_venture "$@" ;;
+  goal)                  cmd_goal "$@" ;;
+  propose)               cmd_propose "$@" ;;
+  approve)               cmd_approve "$@" ;;
+  reject)                cmd_reject "$@" ;;
+  proposals)             cmd_proposals "$@" ;;
+  spawn)                 cmd_spawn "$@" ;;
+  templates)             cmd_templates "$@" ;;
+  help|-h|--help)        cmd_help ;;
+  *)
+    echo "${RED}Unknown command: $cmd${RESET}" >&2; echo >&2
+    cmd_help >&2; exit 1 ;;
+esac
