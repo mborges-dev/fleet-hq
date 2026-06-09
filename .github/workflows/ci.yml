@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    name: shellcheck (bash linter)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint fleet + scripts/*.sh
+        run: shellcheck -S warning fleet scripts/*.sh
+
+  syntax:
+    name: bash syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check fleet is parseable
+        run: bash -n fleet
+      - name: Check all helper scripts are parseable
+        run: |
+          for f in scripts/*.sh; do
+            bash -n "$f" || exit 1
+          done
