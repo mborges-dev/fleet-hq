@@ -1084,6 +1084,15 @@ ${BOLD}NOTIFICATIONS${RESET}
   ${CYAN}dnd${RESET} [on|off|HH:MM-HH:MM]
   ${CYAN}notify${RESET} <agent> "message"
 
+${BOLD}MEMORY${RESET}
+  ${CYAN}memory write${RESET} <scope>/<file> [--from <agent>] "<content>"
+  ${CYAN}memory read${RESET} <scope>/<file> [--section "..."]
+  ${CYAN}memory list${RESET} [<scope>]            List files in a scope
+  ${CYAN}memory search${RESET} "<query>" [--scope X] [--limit N]
+  ${CYAN}memory recall${RESET} <agent>            Most-relevant memories for this agent
+  ${CYAN}memory reindex${RESET}                   Rebuild FTS index from disk
+  ${CYAN}memory stats${RESET}                     Memory database stats
+
 ${BOLD}DASHBOARD${RESET}
   ${CYAN}dashboard${RESET} (hq) [port=4242]      Open Fleet HQ live UI
 
@@ -1119,6 +1128,7 @@ case "$cmd" in
   schedules)             cmd_schedules "$@" ;;
   scheduler)             cmd_scheduler "$@" ;;
   watcher)               "$SCRIPTS/watcher.sh" "$@" ;;
+  memory|mem)            "$SCRIPTS/memory.sh" "$@" ;;
   world|worlds)          cmd_world "$@" ;;
   assign)                cmd_assign "$@" ;;
   events)                cmd_events "$@" ;;
